@@ -53,6 +53,7 @@ assets/
 
 - **Frontend** (`client/`): React app using `@semoss/sdk` to communicate with SEMOSS. Builds to `portals/`. See `client/README.md`.
 - **Java Reactors** (`java/`): Backend logic compiled by SEMOSS into `classes/`. Click "Recompile reactors" in the SEMOSS UI after changes. See `java/README.md`.
+- **GetTableNames reactor** (`java/src/reactors/ICD_Reactors/GetTableNames.java`): Accepts a `.docx` file name and base64 payload, then returns table candidates (`tableId`, display label, heading, first-row preview, row/column counts) for user selection in the UI.
 - **Python Tools** (`py/`): Add MCP tools in `py/mcp_driver.py` with `@mcp_metadata` decorator. Simple tools can use Playground's default UI (no React needed) by omitting `resourceURI`.
 - **MCP Manifests** (`mcp/`): Auto-generated. Run `MakePythonMCP()` or `MakePixelMCP(...)` to regenerate. Never edit manually.
 - **Publishing**: The SEMOSS UI snapshots `portals/` to a public location. Build first, then publish.
