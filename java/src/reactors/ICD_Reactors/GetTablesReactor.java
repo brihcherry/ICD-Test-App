@@ -7,7 +7,6 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.regex.Pattern;
 import org.apache.poi.xwpf.usermodel.IBodyElement;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
@@ -36,13 +35,12 @@ import reactors.AbstractProjectReactor;
  *
  * Response payload:
  * - documentName
- * - parseId: opaque cache key used by downstream processing steps
  * - tableCount: number of Table A-# candidates
  * - tableCandidates[]: Table A-# candidates
  * - allTableCount: number of all document tables
  * - allTableCandidates[]: all document tables
  *
- * Cached payload (referenced by parseId):
+ * Cached payload (single per insight):
  * - all tables metadata
  * - headerRow
  * - rows (normalized to the widest row in each table)
@@ -90,12 +88,10 @@ public class GetTablesReactor extends AbstractProjectReactor {
 
         // if the parse is successful, cache the full table contents and construct the reactor response payload,
         // which contains table metadata sorted by tableCandidates and allTableCandidates
-        CacheWriteResult cacheWrite =
-            putParsedTablesInVarStore(fileName, parseResult.parsedTables);
+        putParsedTablesInVarStore(fileName, parseResult.parsedTables);
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("documentName", fileName);
-        response.put("parseId", cacheWrite.parseId());
         response.put("tableCount", parseResult.tableCandidates.size());
         response.put("tableCandidates", parseResult.tableCandidates);
         response.put("allTableCount", parseResult.allTableCandidates.size());
@@ -111,7 +107,7 @@ public class GetTablesReactor extends AbstractProjectReactor {
      * - allTableCandidates: all tables in the document with metadata, used as 
      *      a fallback in case the heading-based filter misses the correct table
      * - parsedTables: full table contents and metadata for all tables, which is 
-     *      cached in the var-store and referenced by parseId in the reactor response
+    *      cached in the var-store for downstream reactors
      * 
      *  */
     private ParseResult parseTables(byte[] fileBytes) throws IOException {
@@ -187,34 +183,23 @@ public class GetTablesReactor extends AbstractProjectReactor {
     }
 
     /* 
-     * Helper method that stores all table contents in the SEMOSS var-store
+     * Helper method that stores table contents in the SEMOSS var-store as
+     * a single cache entry for the current insight.
      * 
      *
      *  */
-    @SuppressWarnings("unchecked")
-    private CacheWriteResult putParsedTablesInVarStore(
+    private void putParsedTablesInVarStore(
             String documentName, List<Map<String, Object>> parsedTables) {
         long now = System.currentTimeMillis();
-        String parseId = UUID.randomUUID().toString();
-
-        Map<String, Object> cacheByParseId = new LinkedHashMap<>();
-        NounMetadata existingCacheNoun = this.insight.getVarStore().get(VARSTORE_TABLE_PARSE_CACHE);
-        if (existingCacheNoun != null && existingCacheNoun.getValue() instanceof Map) {
-            cacheByParseId.putAll((Map<String, Object>) existingCacheNoun.getValue());
-        }
 
         Map<String, Object> cacheEntry = new LinkedHashMap<>();
-        cacheEntry.put("parseId", parseId);
         cacheEntry.put("documentName", documentName);
         cacheEntry.put("createdAtEpochMs", now);
         cacheEntry.put("tables", parsedTables);
-        cacheByParseId.put(parseId, cacheEntry);
 
         this.insight
                 .getVarStore()
-                .put(VARSTORE_TABLE_PARSE_CACHE, new NounMetadata(cacheByParseId, PixelDataType.MAP));
-
-        return new CacheWriteResult(parseId);
+                .put(VARSTORE_TABLE_PARSE_CACHE, new NounMetadata(cacheEntry, PixelDataType.MAP));
     }
 
     private List<List<String>> getRows(XWPFTable table, int columnCount) {
@@ -292,7 +277,7 @@ public class GetTablesReactor extends AbstractProjectReactor {
 
     @Override
     public String getReactorDescription() {
-        return "Read a .docx file, cache parsed table data, and return table candidates with parseId.";
+        return "Read a .docx file, cache parsed table data, and return table candidates.";
     }
 
     @Override
@@ -321,15 +306,4 @@ public class GetTablesReactor extends AbstractProjectReactor {
         }
     }
 
-    private static class CacheWriteResult {
-        private final String parseId;
-
-        private CacheWriteResult(String parseId) {
-            this.parseId = parseId;
-        }
-
-        private String parseId() {
-            return parseId;
-        }
-    }
 }

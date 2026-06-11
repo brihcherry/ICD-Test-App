@@ -16,8 +16,7 @@ import reactors.AbstractProjectReactor;
  * only "Field Name" and "Functional Description" columns from the user-selected tables.
  *
  * Inputs:
- * - parseId: the opaque cache key returned by GetTablesReactor
- * - tableIndexes: comma-separated list of 1-based table index integers selected by the user
+ * - tableIndexes: array of 1-based table index integers (example: [1,2,5])
  *
  * Column matching:
  * - "Field Name" and "Functional Description" are matched case-insensitively against
@@ -34,47 +33,30 @@ import reactors.AbstractProjectReactor;
  */
 public class ExtractDataElementsReactor extends AbstractProjectReactor {
 
-    private static final String PARSE_ID_KEY = "parseId";
     private static final String TABLE_INDEXES_KEY = "tableIndexes";
     private static final String VARSTORE_TABLE_PARSE_CACHE = "ICD_TABLE_PARSE_CACHE";
     private static final String FIELD_NAME_HEADER = "field name";
     private static final String FUNCTIONAL_DESC_HEADER = "functional description";
 
     public ExtractDataElementsReactor() {
-        this.keysToGet = new String[] {PARSE_ID_KEY, TABLE_INDEXES_KEY};
-        this.keyRequired = new int[] {1, 1};
+        this.keysToGet = new String[] {TABLE_INDEXES_KEY};
+        this.keyRequired = new int[] {1};
     }
 
     @Override
     @SuppressWarnings("unchecked")
     protected NounMetadata doExecute() {
-        String parseId = this.keyValue.get(PARSE_ID_KEY);
         String tableIndexesRaw = this.keyValue.get(TABLE_INDEXES_KEY);
 
-        if (parseId == null || parseId.isBlank()) {
-            return NounMetadata.getErrorNounMessage("parseId is required.");
-        }
         if (tableIndexesRaw == null || tableIndexesRaw.isBlank()) {
             return NounMetadata.getErrorNounMessage("tableIndexes is required.");
         }
 
-        // parse the comma-separated table index list
-        Set<Integer> requestedIndexes = new HashSet<>();
-        for (String part : tableIndexesRaw.split(",")) {
-            String trimmed = part.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            try {
-                requestedIndexes.add(Integer.parseInt(trimmed));
-            } catch (NumberFormatException e) {
-                return NounMetadata.getErrorNounMessage(
-                    "Invalid value in tableIndexes: \"" + trimmed + "\". Expected integers.");
-            }
-        }
-
-        if (requestedIndexes.isEmpty()) {
-            return NounMetadata.getErrorNounMessage("tableIndexes must contain at least one valid index.");
+        Set<Integer> requestedIndexes;
+        try {
+            requestedIndexes = parseRequestedIndexesArray(tableIndexesRaw);
+        } catch (IllegalArgumentException e) {
+            return NounMetadata.getErrorNounMessage(e.getMessage());
         }
 
         // look up the var-store cache
@@ -84,19 +66,14 @@ public class ExtractDataElementsReactor extends AbstractProjectReactor {
                 "No cached parse data found. Please run GetTables first.");
         }
 
-        Map<String, Object> cacheByParseId = (Map<String, Object>) cacheNoun.getValue();
-        Object entryObj = cacheByParseId.get(parseId);
-        if (!(entryObj instanceof Map)) {
-            return NounMetadata.getErrorNounMessage(
-                "Parse session not found for parseId: " + parseId + ". Please re-run GetTables.");
-        }
-
-        Map<String, Object> cacheEntry = (Map<String, Object>) entryObj;
-        String documentName = (String) cacheEntry.getOrDefault("documentName", "");
+        Map<String, Object> cacheEntry = (Map<String, Object>) cacheNoun.getValue();
         Object tablesObj = cacheEntry.get("tables");
         if (!(tablesObj instanceof List)) {
-            return NounMetadata.getErrorNounMessage("Cached entry is missing table data.");
+            return NounMetadata.getErrorNounMessage(
+                "No cached parse data found. Please run GetTables first.");
         }
+
+        String documentName = (String) cacheEntry.getOrDefault("documentName", "");
 
         List<Map<String, Object>> allTables = (List<Map<String, Object>>) tablesObj;
         List<Map<String, Object>> extractedRows = new ArrayList<>();
@@ -147,7 +124,6 @@ public class ExtractDataElementsReactor extends AbstractProjectReactor {
                 Map<String, Object> extracted = new LinkedHashMap<>();
                 extracted.put("fieldName", fieldName);
                 extracted.put("functionalDescription", functionalDesc);
-                extracted.put("sourceTableLabel", displayLabel);
                 extractedRows.add(extracted);
             }
         }
@@ -183,6 +159,44 @@ public class ExtractDataElementsReactor extends AbstractProjectReactor {
         return value == null ? "" : value.trim();
     }
 
+    private Set<Integer> parseRequestedIndexesArray(String tableIndexesRaw) {
+        String trimmed = tableIndexesRaw.trim();
+
+        // Pixel keyValue can flatten array syntax into CSV in some paths; support both.
+        if ((trimmed.startsWith("\"") && trimmed.endsWith("\""))
+            || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+            trimmed = trimmed.substring(1, trimmed.length() - 1).trim();
+        }
+
+        String body;
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            body = trimmed.substring(1, trimmed.length() - 1).trim();
+        } else {
+            body = trimmed;
+        }
+
+        if (body.isEmpty()) {
+            throw new IllegalArgumentException("tableIndexes must contain at least one index.");
+        }
+
+        Set<Integer> requestedIndexes = new HashSet<>();
+        for (String part : body.split(",")) {
+            String item = part.trim();
+            if (item.isEmpty()) {
+                throw new IllegalArgumentException(
+                    "tableIndexes must contain only integer indexes (example: [1,2,5]).");
+            }
+            try {
+                requestedIndexes.add(Integer.parseInt(item));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(
+                    "tableIndexes must contain only integer indexes (example: [1,2,5]).");
+            }
+        }
+
+        return requestedIndexes;
+    }
+
     @Override
     public String getReactorDescription() {
         return "Extract Field Name and Functional Description columns from user-selected cached tables.";
@@ -190,11 +204,8 @@ public class ExtractDataElementsReactor extends AbstractProjectReactor {
 
     @Override
     public String getDescriptionForKey(String key) {
-        if (PARSE_ID_KEY.equals(key)) {
-            return "The parseId returned by GetTables, used to look up cached table data.";
-        }
         if (TABLE_INDEXES_KEY.equals(key)) {
-            return "Comma-separated list of table index integers selected by the user.";
+            return "Array of table index integers selected by the user (example: [1,2,5]).";
         }
         return null;
     }

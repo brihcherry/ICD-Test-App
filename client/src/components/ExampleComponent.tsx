@@ -16,11 +16,22 @@ type TableCandidate = {
 };
 
 type GetTablesResponse = {
-	parseId?: string;
 	tableCount: number;
 	tableCandidates: TableCandidate[];
 	allTableCount?: number;
 	allTableCandidates?: TableCandidate[];
+};
+
+type SendToModelBatch = {
+	batchNumber: number;
+	batchSize: number;
+	prompt: string;
+	llmCommand?: string;
+};
+
+type SendToModelResponse = {
+	totalBatches: number;
+	batches: SendToModelBatch[];
 };
 
 const isWordDocument = (file: File) => {
@@ -58,15 +69,18 @@ export const ExampleComponent = () => {
 		actions?: { run: (pixel: string) => Promise<unknown> };
 	};
 	const fileInputRef = useRef<HTMLInputElement | null>(null);
+	const dictInputRef = useRef<HTMLInputElement | null>(null);
 	const [selectedFile, setSelectedFile] = useState<File | null>(null);
 	const [isDragActive, setIsDragActive] = useState(false);
 	const [isLoadingTables, setIsLoadingTables] = useState(false);
-	const [isExtractingDataElements, setIsExtractingDataElements] = useState(false);
+	const [isProcessing, setIsProcessing] = useState(false);
+	const [dictionaryFile, setDictionaryFile] = useState<File | null>(null);
+	const [isLoadingDictionary, setIsLoadingDictionary] = useState(false);
+	const [dictionaryLoaded, setDictionaryLoaded] = useState(false);
 	const [tableCandidates, setTableCandidates] = useState<TableCandidate[]>([]);
 	const [allTableCandidates, setAllTableCandidates] = useState<TableCandidate[]>([]);
 	const [selectedTableIndexes, setSelectedTableIndexes] = useState<number[]>([]);
 	const [showAllTables, setShowAllTables] = useState(false);
-	const [parseId, setParseId] = useState<string | null>(null);
 
 	const maxFileBytes = useMemo(() => MAX_FILE_SIZE_MB * 1024 * 1024, []);
 
@@ -90,7 +104,6 @@ export const ExampleComponent = () => {
 		setAllTableCandidates([]);
 		setSelectedTableIndexes([]);
 		setShowAllTables(false);
-		setParseId(null);
 	};
 
 	const handleDrop = (event: DragEvent<HTMLLabelElement>) => {
@@ -105,15 +118,27 @@ export const ExampleComponent = () => {
 		fileInputRef.current?.click();
 	};
 
-	const clearSelection = () => {
+	const clearSelection = async () => {
+		if (actions?.run) {
+			try {
+				await actions.run("ClearTableParseCache()");
+			} catch {
+				// Local reset still proceeds even if cache clear fails.
+			}
+		}
+
 		setSelectedFile(null);
 		setTableCandidates([]);
 		setAllTableCandidates([]);
 		setSelectedTableIndexes([]);
 		setShowAllTables(false);
-		setParseId(null);
+		setDictionaryFile(null);
+		setDictionaryLoaded(false);
 		if (fileInputRef.current) {
 			fileInputRef.current.value = "";
+		}
+		if (dictInputRef.current) {
+			dictInputRef.current.value = "";
 		}
 	};
 
@@ -165,7 +190,6 @@ export const ExampleComponent = () => {
 			const asRecord = node as Record<string, unknown>;
 			if (Array.isArray(asRecord.tableCandidates)) {
 				return {
-					parseId: typeof asRecord.parseId === "string" ? asRecord.parseId : undefined,
 					tableCount:
 						typeof asRecord.tableCount === "number"
 							? asRecord.tableCount
@@ -190,6 +214,76 @@ export const ExampleComponent = () => {
 		}
 
 		return null;
+	};
+
+	const findSendToModelPayload = (
+		node: unknown,
+		depth = 0,
+	): SendToModelResponse | null => {
+		if (depth > 10 || node == null) {
+			return null;
+		}
+
+		if (Array.isArray(node)) {
+			for (const item of node) {
+				const found = findSendToModelPayload(item, depth + 1);
+				if (found) {
+					return found;
+				}
+			}
+			return null;
+		}
+
+		if (typeof node === "object") {
+			const asRecord = node as Record<string, unknown>;
+			if (Array.isArray(asRecord.batches)) {
+				const batches = asRecord.batches as SendToModelBatch[];
+				return {
+					totalBatches:
+						typeof asRecord.totalBatches === "number"
+							? asRecord.totalBatches
+							: batches.length,
+					batches,
+				};
+			}
+
+			for (const value of Object.values(asRecord)) {
+				const found = findSendToModelPayload(value, depth + 1);
+				if (found) {
+					return found;
+				}
+			}
+		}
+
+		return null;
+	};
+
+	const handleUploadDictionary = async (file: File) => {
+		if (!file.name.toLowerCase().endsWith(".docx")) {
+			toast.error("Data dictionary must be a .docx file.");
+			return;
+		}
+
+		if (!actions?.run) {
+			toast.error("SEMOSS actions are not initialized yet.");
+			return;
+		}
+
+		setIsLoadingDictionary(true);
+		try {
+			const base64 = await fileToBase64(file);
+			const command = `GetDataDictionary(fileName=${JSON.stringify(file.name)}, fileContentBase64=${JSON.stringify(base64)})`;
+			await actions.run(command);
+			setDictionaryFile(file);
+			setDictionaryLoaded(true);
+			toast.success(`Data dictionary "${file.name}" loaded.`);
+		} catch (error) {
+			const message =
+				error instanceof Error ? error.message : "Failed to load data dictionary.";
+			toast.error(message);
+		} finally {
+			setIsLoadingDictionary(false);
+		}
 	};
 
 	const handleGetTables = async () => {
@@ -219,7 +313,6 @@ export const ExampleComponent = () => {
 				throw new Error("GetTables did not return tableCandidates.");
 			}
 
-			setParseId(payload.parseId ?? null);
 			setTableCandidates(payload.tableCandidates);
 			setAllTableCandidates(payload.allTableCandidates ?? payload.tableCandidates);
 			setSelectedTableIndexes([]);
@@ -241,14 +334,14 @@ export const ExampleComponent = () => {
 	const noTablesFound = allTableCandidates.length === 0;
 	const noFilteredMatches = tableCandidates.length === 0 && allTableCandidates.length > 0;
 
-	const handleGetDataElements = async () => {
-		if (selectedTableIndexes.length === 0) {
-			toast.error("Select at least one table.");
+	const handleExtractAndSendToModel = async () => {
+		if (!dictionaryLoaded) {
+			toast.error("Upload and load a data dictionary before sending to model.");
 			return;
 		}
 
-		if (!parseId) {
-			toast.error("No parse session found. Please re-run \"Get tables\" first.");
+		if (selectedTableIndexes.length === 0) {
+			toast.error("Select at least one table.");
 			return;
 		}
 
@@ -257,22 +350,48 @@ export const ExampleComponent = () => {
 			return;
 		}
 
-		setIsExtractingDataElements(true);
+		setIsProcessing(true);
 		try {
-			const tableIndexesStr = selectedTableIndexes.join(",");
-			const command = `ExtractDataElements(parseId=${JSON.stringify(parseId)}, tableIndexes=${JSON.stringify(tableIndexesStr)})`;
-			await actions.run(command);
+			const tableIndexesPayload = `[${selectedTableIndexes
+				.map((index) => Number(index))
+				.join(",")}]`;
+
+			// Step 1: Extract data elements from selected tables
+			const extractCommand = `ExtractDataElements(tableIndexes=${tableIndexesPayload})`;
+			await actions.run(extractCommand);
+
+			// Step 2: Build and execute data element batches.
+			// Dictionary context is applied server-side for each batch call.
+			const sendCommand = `SendDataElementsToModel(tableIndexes=${tableIndexesPayload})`;
+			const result = await actions.run(sendCommand);
+			const payload = findSendToModelPayload(result);
+
+			if (!payload) {
+				throw new Error("SendDataElementsToModel did not return batch payload.");
+			}
+
+			// Step 4: Execute each batch LLM call
+			// Step 3: Execute each batch LLM call
+			for (const batch of payload.batches) {
+				if (!batch.llmCommand) {
+					continue;
+				}
+				await actions.run(batch.llmCommand);
+			}
+
 			toast.success(
-				`Extracted data elements from ${selectedTableIndexes.length} table(s).`,
+				payload.totalBatches != null
+					? `Extracted and sent ${selectedTableIndexes.length} table(s) to model in ${payload.totalBatches} batch(es).`
+					: `Extracted and sent ${selectedTableIndexes.length} table(s) to model in batches.`,
 			);
 		} catch (error) {
 			const message =
 				error instanceof Error
 					? error.message
-					: "Failed to extract data elements.";
+					: "Failed to extract and send data elements to model.";
 			toast.error(message);
 		} finally {
-			setIsExtractingDataElements(false);
+			setIsProcessing(false);
 		}
 	};
 
@@ -280,13 +399,52 @@ export const ExampleComponent = () => {
 		<div className="mx-auto max-w-3xl space-y-6 p-6 md:p-10">
 			<div className="space-y-2">
 				<h1 className="text-2xl font-semibold tracking-tight md:text-3xl">
-					Upload ICD Word Document
+					Upload ICD Test
 				</h1>
-				<p className="text-sm text-muted-foreground md:text-base">
-					Upload a source Word file, scan all tables with GetTables, and then
-					choose the table that contains the ICD data elements.
-				</p>
 			</div>
+			
+			<div className="rounded-xl border bg-card p-5 shadow-sm md:p-6">
+				<Label htmlFor="dict-file" className="text-sm font-medium">
+					Data Dictionary
+					<span className="ml-2 text-xs font-normal text-muted-foreground">
+						required for model classification context
+					</span>
+				</Label>
+				<input
+					id="dict-file"
+					type="file"
+					accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+					className="hidden"
+					ref={dictInputRef}
+					onChange={(event) => {
+						const file = event.target.files?.[0];
+						if (file) {
+							handleUploadDictionary(file);
+						}
+					}}
+				/>
+				<div className="mt-3 flex flex-wrap items-center gap-3">
+					<Button
+						type="button"
+						variant="outline"
+						disabled={isLoadingDictionary}
+						onClick={() => dictInputRef.current?.click()}
+					>
+						{isLoadingDictionary ? "Loading..." : "Upload Data Dictionary"}
+					</Button>
+					{dictionaryFile && !isLoadingDictionary ? (
+						<div className="flex items-center gap-2 text-sm text-muted-foreground">
+							<FileText className="h-4 w-4 text-primary" />
+							<span>{dictionaryFile.name}</span>
+							{dictionaryLoaded ? (
+								<span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs text-primary">
+									Loaded
+								</span>
+							) : null}
+						</div>
+					) : null}
+				</div>
+			</div> 
 
 			<div className="rounded-xl border bg-card p-5 shadow-sm md:p-6">
 				<Label htmlFor="word-file" className="text-sm font-medium">
@@ -471,15 +629,13 @@ export const ExampleComponent = () => {
 							<p className="text-sm text-muted-foreground">
 								{selectedTableIndexes.length} table(s) selected
 							</p>
-							<Button
-								type="button"
-								onClick={handleGetDataElements}
-								disabled={selectedTableIndexes.length === 0 || isExtractingDataElements}
-							>
-								{isExtractingDataElements
-									? "Submitting..."
-									: "Get Data Elements"}
-							</Button>
+						<Button
+							type="button"
+							onClick={handleExtractAndSendToModel}
+							disabled={selectedTableIndexes.length === 0 || isProcessing}
+						>
+							{isProcessing ? "Processing..." : "Extract and Send to Model"}
+						</Button>
 						</div>
 					</>
 				)}
