@@ -10,7 +10,7 @@
 
 import { useInsight } from "@semoss/sdk/react";
 import { Outlet } from "react-router-dom";
-import { LoadingScreen } from "@/components";
+import { LoadingScreen, MainNavigation } from "@/components";
 import { ErrorPage } from "../ErrorPage";
 
 export const InitializedLayout = () => {
@@ -19,10 +19,13 @@ export const InitializedLayout = () => {
 	return (
 		<div className="flex flex-col h-screen">
 			{isInitialized ? (
-				<div className="p-4 overflow-auto h-full">
-					{/* Outlet renders whichever child route matched in Router.tsx */}
-					<Outlet />
-				</div>
+				<>
+					<MainNavigation />
+					<div className="p-4 overflow-auto h-full">
+						{/* Outlet renders whichever child route matched in Router.tsx */}
+						<Outlet />
+					</div>
+				</>
 			) : error ? (
 				<ErrorPage />
 			) : (

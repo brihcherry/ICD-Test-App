@@ -7,10 +7,7 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
-import org.apache.poi.xwpf.usermodel.IBodyElement;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
-import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import org.apache.poi.xwpf.usermodel.XWPFTable;
 import org.apache.poi.xwpf.usermodel.XWPFTableCell;
 import org.apache.poi.xwpf.usermodel.XWPFTableRow;
@@ -20,25 +17,20 @@ import reactors.AbstractProjectReactor;
 
 /*
  * GetTablesReactor reads a user-uploaded .docx file, caches all table contents
- * and metadata in the SEMOSS insight var-store, and returns a filtered list of
- * likely data element tables.
+ * and metadata in the SEMOSS insight var-store, and returns all document tables.
  *
  * Inputs:
  * - fileName: original document name (must end with .docx)
  * - fileContentBase64: full .docx payload encoded as base64
  *
- * Table filter:
- * - A table is added to the tableCandidates list if it is preceeded by text beginning
- *   with "Table A-" followed by a number (eg: "Table A-1", "Table A-2").
- * - Matching uses only the immediate preceding non-empty paragraph.
- * - All tables are still cached and returned in allTableCandidates as a fallback option.
+ * Table handling:
+ * - All tables are returned in tableCandidates.
+ * - Table labels are deterministic: "Table 1", "Table 2", etc.
  *
  * Response payload:
  * - documentName
- * - tableCount: number of Table A-# candidates
- * - tableCandidates[]: Table A-# candidates
- * - allTableCount: number of all document tables
- * - allTableCandidates[]: all document tables
+ * - tableCount: number of all document tables
+ * - tableCandidates[]: all document tables
  *
  * Cached payload (single per insight):
  * - all tables metadata
@@ -51,10 +43,6 @@ public class GetTablesReactor extends AbstractProjectReactor {
     private static final String FILE_CONTENT_BASE64_KEY = "fileContentBase64";
     private static final String VARSTORE_TABLE_PARSE_CACHE = "ICD_TABLE_PARSE_CACHE";
     private static final int MAX_PREVIEW_CELLS = 8;
-    private static final Pattern TABLE_A_HEADING_PATTERN =
-        Pattern.compile(
-            "^[^a-z0-9]*table\\s+a(?:\\s*[-\\u2010-\\u2015\\u2212]\\s*|\\s+)?\\d+\\b",
-            Pattern.CASE_INSENSITIVE);
 
     public GetTablesReactor() {
         this.keysToGet = new String[] {FILE_NAME_KEY, FILE_CONTENT_BASE64_KEY};
@@ -86,82 +74,49 @@ public class GetTablesReactor extends AbstractProjectReactor {
             return NounMetadata.getErrorNounMessage("Unable to parse .docx file content.");
         }
 
-        // if the parse is successful, cache the full table contents and construct the reactor response payload,
-        // which contains table metadata sorted by tableCandidates and allTableCandidates
+        // if the parse is successful, cache the full table contents and construct the reactor response payload
         putParsedTablesInVarStore(fileName, parseResult.parsedTables);
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("documentName", fileName);
         response.put("tableCount", parseResult.tableCandidates.size());
         response.put("tableCandidates", parseResult.tableCandidates);
-        response.put("allTableCount", parseResult.allTableCandidates.size());
-        response.put("allTableCandidates", parseResult.allTableCandidates);
 
         return new NounMetadata(response, PixelDataType.MAP);
     }
 
     /*
-     * Helper method that parses the .docx file and returns three lists:
-     * - filteredTableCandidates: tables that are preceeded by a "Table A-#" heading 
-    *      using the immediate preceding non-empty paragraph only
-     * - allTableCandidates: all tables in the document with metadata, used as 
-     *      a fallback in case the heading-based filter misses the correct table
-     * - parsedTables: full table contents and metadata for all tables, which is 
-    *      cached in the var-store for downstream reactors
-     * 
-     *  */
+     * Helper method that parses the .docx file and returns two lists:
+     * - tableCandidates: all tables in the document with lightweight metadata and preview rows
+     * - parsedTables: full table contents and metadata for cache-backed downstream reactors
+     */
     private ParseResult parseTables(byte[] fileBytes) throws IOException {
-        List<Map<String, Object>> filteredTableCandidates = new ArrayList<>();
-        List<Map<String, Object>> allTableCandidates = new ArrayList<>();
+        List<Map<String, Object>> tableCandidates = new ArrayList<>();
         List<Map<String, Object>> parsedTables = new ArrayList<>();
 
         try (XWPFDocument document = new XWPFDocument(new ByteArrayInputStream(fileBytes))) {
-            // for each paragraph element, store it in case it preceeds a table, in which 
-            // case we will keep it as the table header
-            List<IBodyElement> bodyElements = document.getBodyElements();
-
-            String latestHeadingText = "";
+            List<XWPFTable> tables = document.getTables();
             int tableCount = 0;
-            // iterate through each paragraph element and check whether it's a heading
-            for (IBodyElement bodyElement : bodyElements) {
-                if (bodyElement instanceof XWPFParagraph paragraph) {
-                    String paragraphText = safeTrim(paragraph.getText());
-                    if (!paragraphText.isEmpty()) {
-                        latestHeadingText = paragraphText;
-                    }
-                    continue;
-                }
-
-                // if the next item isn't a table, ignore it and overwrite the previous header
-                // candidate on the next pass
-                if (!(bodyElement instanceof XWPFTable table)) {
-                    continue;
-                }
+            for (XWPFTable table : tables) {
 
                 tableCount += 1;
-                
-                // if it's a table, store the metadata (rows, columns, preview) in the return payload
+
+                // store lightweight metadata and preview in the return payload
                 int rowCount = table.getRows() == null ? 0 : table.getRows().size();
                 int columnCount = getMaxColumnCount(table);
                 List<String> firstRowPreview = getFirstRowPreview(table);
-                String headingBeforeTable = latestHeadingText;
-                String matchedTableAHeading = isTableAHeading(headingBeforeTable) ? headingBeforeTable : null;
-
-                String displayLabel =
-                    matchedTableAHeading != null
-                        ? matchedTableAHeading
-                        : (headingBeforeTable.isEmpty() ? "Table " + tableCount : headingBeforeTable);
+                String displayLabel = "Table " + tableCount;
+                List<List<String>> allRows = getRows(table, columnCount);
+                List<List<String>> previewRows = allRows.subList(0, Math.min(3, allRows.size()));
 
                 Map<String, Object> candidate = new LinkedHashMap<>();
                 candidate.put("index", tableCount);
                 candidate.put("displayLabel", displayLabel);
                 candidate.put("firstRowPreview", firstRowPreview);
+                candidate.put("previewRows", previewRows);
                 candidate.put("rowCount", rowCount);
                 candidate.put("columnCount", columnCount);
-                allTableCandidates.add(candidate);
-                if (matchedTableAHeading != null) {
-                    filteredTableCandidates.add(candidate);
-                }
+                tableCandidates.add(candidate);
 
                 // store the full table contents into the cached payload
                 Map<String, Object> fullTable = new LinkedHashMap<>();
@@ -170,16 +125,14 @@ public class GetTablesReactor extends AbstractProjectReactor {
                 fullTable.put("firstRowPreview", firstRowPreview);
                 fullTable.put("rowCount", rowCount);
                 fullTable.put("columnCount", columnCount);
-
-                List<List<String>> rows = getRows(table, columnCount);
-                fullTable.put("rows", rows);
-                fullTable.put("headerRow", rows.isEmpty() ? new ArrayList<String>() : rows.get(0));
+                fullTable.put("rows", allRows);
+                fullTable.put("headerRow", allRows.isEmpty() ? new ArrayList<String>() : allRows.get(0));
 
                 parsedTables.add(fullTable);
             }
         }
 
-        return new ParseResult(filteredTableCandidates, allTableCandidates, parsedTables);
+        return new ParseResult(tableCandidates, parsedTables);
     }
 
     /* 
@@ -268,13 +221,6 @@ public class GetTablesReactor extends AbstractProjectReactor {
         return value == null ? "" : value.trim().replaceAll("\\s+", " ");
     }
 
-    private boolean isTableAHeading(String headingBeforeTable) {
-        if (headingBeforeTable == null || headingBeforeTable.isEmpty()) {
-            return false;
-        }
-        return TABLE_A_HEADING_PATTERN.matcher(headingBeforeTable).find();
-    }
-
     @Override
     public String getReactorDescription() {
         return "Read a .docx file, cache parsed table data, and return table candidates.";
@@ -293,15 +239,12 @@ public class GetTablesReactor extends AbstractProjectReactor {
 
     private static class ParseResult {
         private final List<Map<String, Object>> tableCandidates;
-        private final List<Map<String, Object>> allTableCandidates;
         private final List<Map<String, Object>> parsedTables;
 
         private ParseResult(
                 List<Map<String, Object>> tableCandidates,
-                List<Map<String, Object>> allTableCandidates,
                 List<Map<String, Object>> parsedTables) {
             this.tableCandidates = tableCandidates;
-            this.allTableCandidates = allTableCandidates;
             this.parsedTables = parsedTables;
         }
     }

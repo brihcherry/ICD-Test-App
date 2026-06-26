@@ -30,8 +30,6 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
 
   private static final String VARSTORE_TABLE_PARSE_CACHE = "ICD_TABLE_PARSE_CACHE";
   private static final String VARSTORE_DICTIONARY_CACHE = "ICD_DICTIONARY_CACHE";
-  private static final String FIELD_NAME_HEADER = "field name";
-  private static final String FUNCTIONAL_DESC_HEADER = "functional description";
 
   private static final String DEFAULT_ENGINE_ID = "aa876e7e-e78e-404d-b7db-1a44236bc2a5";
   private static final int DEFAULT_BATCH_SIZE = 10;
@@ -85,8 +83,8 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
     }
 
     List<Map<String, Object>> allTables = (List<Map<String, Object>>) tablesObj;
-    List<Map<String, Object>> extractedRows = extractRows(allTables, requestedIndexes);
-    if (extractedRows.isEmpty()) {
+    List<Map<String, Object>> selectedTables = filterSelectedTables(allTables, requestedIndexes);
+    if (selectedTables.isEmpty()) {
       Map<String, Object> emptyResponse = new LinkedHashMap<>();
       emptyResponse.put("documentName", documentName);
       emptyResponse.put("engine", engine);
@@ -97,7 +95,8 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
       return new NounMetadata(emptyResponse, PixelDataType.MAP);
     }
 
-    List<List<Map<String, Object>>> batches = toBatches(extractedRows, DEFAULT_BATCH_SIZE);
+    int totalRows = countRows(selectedTables);
+    List<List<Map<String, Object>>> batches = toBatches(selectedTables, DEFAULT_BATCH_SIZE);
     List<Map<String, Object>> batchResults = new ArrayList<>();
 
     for (int i = 0; i < batches.size(); i++) {
@@ -117,7 +116,7 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
     Map<String, Object> response = new LinkedHashMap<>();
     response.put("engine", engine);
     response.put("batchSize", DEFAULT_BATCH_SIZE);
-    response.put("totalRows", extractedRows.size());
+    response.put("totalRows", totalRows);
     response.put("totalBatches", batches.size());
     response.put("batches", batchResults);
 
@@ -177,9 +176,9 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
   }
 
   @SuppressWarnings("unchecked")
-  private List<Map<String, Object>> extractRows(
+  private List<Map<String, Object>> filterSelectedTables(
       List<Map<String, Object>> allTables, Set<Integer> requestedIndexes) {
-    List<Map<String, Object>> extractedRows = new ArrayList<>();
+    List<Map<String, Object>> selectedTables = new ArrayList<>();
 
     for (Map<String, Object> table : allTables) {
       Object indexObj = table.get("index");
@@ -192,99 +191,123 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
         continue;
       }
 
-      String displayLabel = (String) table.getOrDefault("displayLabel", "Table " + tableIndex);
+      selectedTables.add(table);
+    }
+
+    return selectedTables;
+  }
+
+  private int countRows(List<Map<String, Object>> tables) {
+    int count = 0;
+    for (Map<String, Object> table : tables) {
       Object rowsObj = table.get("rows");
-      if (!(rowsObj instanceof List)) {
-        continue;
-      }
-
-      List<List<String>> rows = (List<List<String>>) rowsObj;
-      if (rows.isEmpty()) {
-        continue;
-      }
-
-      List<String> headerRow = rows.get(0);
-      int fieldNameCol = findColumnIndex(headerRow, FIELD_NAME_HEADER);
-      int functionalDescCol = findColumnIndex(headerRow, FUNCTIONAL_DESC_HEADER);
-      if (fieldNameCol < 0 && functionalDescCol < 0) {
-        continue;
-      }
-
-      for (int i = 1; i < rows.size(); i++) {
-        List<String> row = rows.get(i);
-        String fieldName = getCell(row, fieldNameCol);
-        String functionalDesc = getCell(row, functionalDescCol);
-        if (fieldName.isEmpty() && functionalDesc.isEmpty()) {
-          continue;
-        }
-
-        Map<String, Object> extracted = new LinkedHashMap<>();
-        extracted.put("fieldName", fieldName);
-        extracted.put("functionalDescription", functionalDesc);
-        extracted.put("sourceTableLabel", displayLabel);
-        extractedRows.add(extracted);
+      if (rowsObj instanceof List) {
+        count += ((List<?>) rowsObj).size();
       }
     }
-
-    return extractedRows;
+    return count;
   }
 
-  private int findColumnIndex(List<String> headerRow, String targetHeader) {
-    String lowerTarget = targetHeader.toLowerCase();
-    for (int i = 0; i < headerRow.size(); i++) {
-      String cell = headerRow.get(i);
-      if (cell != null && cell.trim().toLowerCase().startsWith(lowerTarget)) {
-        return i;
-      }
-    }
-    return -1;
-  }
-
-  private String getCell(List<String> row, int colIndex) {
-    if (colIndex < 0 || colIndex >= row.size()) {
-      return "";
-    }
-    String value = row.get(colIndex);
-    return value == null ? "" : value.trim();
-  }
-
-  private List<List<Map<String, Object>>> toBatches(List<Map<String, Object>> rows, int batchSize) {
+  private List<List<Map<String, Object>>> toBatches(List<Map<String, Object>> tables, int batchSize) {
     List<List<Map<String, Object>>> batches = new ArrayList<>();
-    for (int start = 0; start < rows.size(); start += batchSize) {
-      int end = Math.min(start + batchSize, rows.size());
-      batches.add(new ArrayList<>(rows.subList(start, end)));
+    List<Map<String, Object>> currentBatch = new ArrayList<>();
+    int currentRowCount = 0;
+
+    for (Map<String, Object> table : tables) {
+      Object rowsObj = table.get("rows");
+      int tableRowCount = rowsObj instanceof List ? ((List<?>) rowsObj).size() : 0;
+
+      // If current batch is full and has items, start a new batch
+      if (currentRowCount + tableRowCount > batchSize && !currentBatch.isEmpty()) {
+        batches.add(new ArrayList<>(currentBatch));
+        currentBatch.clear();
+        currentRowCount = 0;
+      }
+
+      currentBatch.add(table);
+      currentRowCount += tableRowCount;
     }
+
+    // Add any remaining tables
+    if (!currentBatch.isEmpty()) {
+      batches.add(currentBatch);
+    }
+
     return batches;
   }
 
+  @SuppressWarnings("unchecked")
   private String buildBatchPrompt(
       String documentName,
       int batchNumber,
       int totalBatches,
-      List<Map<String, Object>> batchRows) {
+      List<Map<String, Object>> batchTables) {
     StringBuilder sb = new StringBuilder();
-    sb.append("You are assisting with ICD data element processing. ")
-      .append("Use the data dictionary context to assign a Data Subject Area to each data element. ")
-      .append("Return ONLY a markdown table with the exact columns: Data Element, Data Subject Area, Confidence. ")
+    sb.append("You are assisting with ICD data element extraction. ")
+      .append("Use the data dictionary context to identify data elements, derive a concise Description from ICD row context, infer Variable Type, Field Length, Delimited status, and Value Range from ICD table content, and assign Data Subject Areas to each. ")
+      .append("Return ONLY a markdown table with the exact columns: Data Element, Description, Variable Type, Field Length, Delimited, Value Range, Data Subject Area Primary, Data Subject Area 2, Data Subject Area 3, Confidence. ")
       .append("Do not include any prose, bullets, or code fences before or after the table.\n\n")
+      .append("CRITICAL: Extract one row in your output for EACH row in the input tables below. ")
+      .append("Process ALL rows, not a subset. The number of output rows must match the number of input rows.\n\n")
+      .append("Data Subject Area rules: For every row, return exactly 3 ranked DSA suggestions from the data dictionary context. ")
+      .append("Put the best match in Data Subject Area Primary, second-best in Data Subject Area 2, and third-best in Data Subject Area 3. ")
+      .append("Do not leave these blank and do not repeat the same DSA across the 3 DSA columns for the same row.\n\n")
+      .append("Variable Type rules: Regardless of how the ICD describes the type (e.g. varchar, char, text, string, alphanumeric, A/N \u2192 'Character'; ")
+      .append("int, integer, number, numeric, decimal, float, double, NUM \u2192 'Numeric'), ")
+      .append("you MUST output ONLY the single word 'Character' or 'Numeric' in the Variable Type column. No other values are allowed.\n\n")
       .append("Document: ").append(documentName).append("\n")
-      .append("Batch: ").append(batchNumber).append(" of ").append(totalBatches).append("\n\n")
-      .append("Data elements:\n");
+      .append("Batch: ").append(batchNumber).append(" of ").append(totalBatches).append("\n\n");
 
-    for (int i = 0; i < batchRows.size(); i++) {
-      Map<String, Object> row = batchRows.get(i);
-      String fieldName = String.valueOf(row.getOrDefault("fieldName", ""));
-      String functionalDescription = String.valueOf(row.getOrDefault("functionalDescription", ""));
-      String sourceTableLabel = String.valueOf(row.getOrDefault("sourceTableLabel", ""));
+    sb.append("Tables in this batch:\n\n");
+    sb.append("IMPORTANT: In each table below, the first row after the header separator line (---) is DATA, not a header. ")
+      .append("Do NOT extract column names as data elements. Only extract from the actual data rows.\n\n");
 
-      sb.append(i + 1)
-        .append(") Field Name: ").append(fieldName)
-        .append(" | Functional Description: ").append(functionalDescription)
-        .append(" | Source Table: ").append(sourceTableLabel)
-        .append("\n");
+    for (Map<String, Object> table : batchTables) {
+      String sourceLabel = String.valueOf(table.getOrDefault("sourceTableLabel", "Unknown"));
+      Object headerObj = table.get("headerRow");
+      Object rowsObj = table.get("rows");
+
+      if (rowsObj instanceof List) {
+        List<List<String>> rows = (List<List<String>>) rowsObj;
+        sb.append("Table: ").append(sourceLabel).append(" (").append(rows.size()).append(" data rows)\n");
+      } else {
+        sb.append("Table: ").append(sourceLabel).append("\n");
+      }
+
+      if (headerObj instanceof List) {
+        List<String> headers = (List<String>) headerObj;
+        sb.append("| ");
+        for (String header : headers) {
+          sb.append(header).append(" | ");
+        }
+        sb.append("\n");
+        sb.append("|");
+        for (int i = 0; i < headers.size(); i++) {
+          sb.append(" --- |");
+        }
+        sb.append("\n");
+      }
+
+      if (rowsObj instanceof List) {
+        List<List<String>> rows = (List<List<String>>) rowsObj;
+        for (List<String> row : rows) {
+          sb.append("| ");
+          for (String cell : row) {
+            sb.append(cell == null ? "" : cell).append(" | ");
+          }
+          sb.append("\n");
+        }
+      }
+
+      sb.append("\n");
     }
 
-    sb.append("\nReturn your sorted output as plain text for now.");
+    sb.append("Identify which column(s) contain the data elements and which values indicate variable/data type, field length, delimiter usage, and value range information. ")
+      .append("For Description, provide a concise plain-language definition for each data element using ICD row context; if an explicit definition/description text exists in the row, use that wording. ")
+      .append("Return Field Length, Delimited, and Value Range exactly as represented or implied by the ICD table row when available. ")
+      .append("For Variable Type, normalize to exactly 'Character' or 'Numeric' as instructed above. ")
+      .append("For Data Subject Area, return 3 ranked suggestions in the three DSA columns for every row. ")
+      .append("For each data row in the tables above (rows below the --- separator), create one corresponding output row in the markdown table.");
     return sb.toString();
   }
 

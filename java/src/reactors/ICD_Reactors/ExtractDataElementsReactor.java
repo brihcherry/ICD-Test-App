@@ -12,31 +12,25 @@ import reactors.AbstractProjectReactor;
 
 /*
  * ExtractDataElementsReactor reads cached table data from the SEMOSS insight var-store
- * (written by GetTablesReactor) and extracts a simplified two-column table containing
- * only "Field Name" and "Functional Description" columns from the user-selected tables.
+ * (written by GetTablesReactor) and extracts full table data from the user-selected tables,
+ * including all columns and rows. The model will then intelligently identify which columns
+ * contain data elements.
  *
  * Inputs:
  * - tableIndexes: array of 1-based table index integers (example: [1,2,5])
  *
- * Column matching:
- * - "Field Name" and "Functional Description" are matched case-insensitively against
- *   each table's header row.
- * - Rows where both extracted values are empty are skipped.
- *
  * Response payload:
  * - documentName: original document name from the cache
- * - rowCount: total number of extracted data rows across all selected tables
- * - rows[]: flat merged list from all selected tables, each entry contains:
- *     - fieldName
- *     - functionalDescription
+ * - totalRowCount: total number of extracted data rows across all selected tables
+ * - tables[]: list of extracted tables, each containing:
  *     - sourceTableLabel: display label of the source table
+ *     - headerRow: array of column names
+ *     - rows: array of data rows (each row is an array of strings)
  */
 public class ExtractDataElementsReactor extends AbstractProjectReactor {
 
     private static final String TABLE_INDEXES_KEY = "tableIndexes";
     private static final String VARSTORE_TABLE_PARSE_CACHE = "ICD_TABLE_PARSE_CACHE";
-    private static final String FIELD_NAME_HEADER = "field name";
-    private static final String FUNCTIONAL_DESC_HEADER = "functional description";
 
     public ExtractDataElementsReactor() {
         this.keysToGet = new String[] {TABLE_INDEXES_KEY};
@@ -76,7 +70,8 @@ public class ExtractDataElementsReactor extends AbstractProjectReactor {
         String documentName = (String) cacheEntry.getOrDefault("documentName", "");
 
         List<Map<String, Object>> allTables = (List<Map<String, Object>>) tablesObj;
-        List<Map<String, Object>> extractedRows = new ArrayList<>();
+        List<Map<String, Object>> extractedTables = new ArrayList<>();
+        int totalRowCount = 0;
 
         for (Map<String, Object> table : allTables) {
             Object indexObj = table.get("index");
@@ -100,64 +95,35 @@ public class ExtractDataElementsReactor extends AbstractProjectReactor {
                 continue;
             }
 
-            // find the column positions of the two target headers in the header row
+            // Extract header and all data rows (header is at index 0)
             List<String> headerRow = rows.get(0);
-            int fieldNameCol = findColumnIndex(headerRow, FIELD_NAME_HEADER);
-            int functionalDescCol = findColumnIndex(headerRow, FUNCTIONAL_DESC_HEADER);
+            List<List<String>> dataRows = new ArrayList<>();
+            for (int i = 1; i < rows.size(); i++) {
+                dataRows.add(rows.get(i));
+            }
 
-            // skip tables that don't have at least one of the target columns
-            if (fieldNameCol < 0 && functionalDescCol < 0) {
+            // Skip tables with no data rows
+            if (dataRows.isEmpty()) {
                 continue;
             }
 
-            // extract data rows (skip header at index 0)
-            for (int i = 1; i < rows.size(); i++) {
-                List<String> row = rows.get(i);
-                String fieldName = getCell(row, fieldNameCol);
-                String functionalDesc = getCell(row, functionalDescCol);
-
-                // skip rows where both values are empty
-                if (fieldName.isEmpty() && functionalDesc.isEmpty()) {
-                    continue;
-                }
-
-                Map<String, Object> extracted = new LinkedHashMap<>();
-                extracted.put("fieldName", fieldName);
-                extracted.put("functionalDescription", functionalDesc);
-                extractedRows.add(extracted);
-            }
+            Map<String, Object> extractedTable = new LinkedHashMap<>();
+            extractedTable.put("sourceTableLabel", displayLabel);
+            extractedTable.put("headerRow", headerRow);
+            extractedTable.put("rows", dataRows);
+            extractedTables.add(extractedTable);
+            totalRowCount += dataRows.size();
         }
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("documentName", documentName);
-        response.put("rowCount", extractedRows.size());
-        response.put("rows", extractedRows);
+        response.put("totalRowCount", totalRowCount);
+        response.put("tables", extractedTables);
 
         return new NounMetadata(response, PixelDataType.MAP);
     }
 
-    /*
-     * Finds the index of the first header cell that starts with the target string
-     * (case-insensitive, trimmed). Returns -1 if not found.
-     */
-    private int findColumnIndex(List<String> headerRow, String targetHeader) {
-        String lowerTarget = targetHeader.toLowerCase();
-        for (int i = 0; i < headerRow.size(); i++) {
-            String cell = headerRow.get(i);
-            if (cell != null && cell.trim().toLowerCase().startsWith(lowerTarget)) {
-                return i;
-            }
-        }
-        return -1;
-    }
 
-    private String getCell(List<String> row, int colIndex) {
-        if (colIndex < 0 || colIndex >= row.size()) {
-            return "";
-        }
-        String value = row.get(colIndex);
-        return value == null ? "" : value.trim();
-    }
 
     private Set<Integer> parseRequestedIndexesArray(String tableIndexesRaw) {
         String trimmed = tableIndexesRaw.trim();
@@ -199,7 +165,7 @@ public class ExtractDataElementsReactor extends AbstractProjectReactor {
 
     @Override
     public String getReactorDescription() {
-        return "Extract Field Name and Functional Description columns from user-selected cached tables.";
+        return "Extract all columns from user-selected cached tables for model processing.";
     }
 
     @Override
