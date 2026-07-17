@@ -54,6 +54,22 @@ client/
 - **Sending results to Playground**: `actions.sendMCPResponseToPlayground(response, status, executedParams)`
 - **Escaping user input**: Always use `JSON.stringify()` when interpolating into Pixel commands
 
+## ICD Frontend Workflow
+
+The ICD page now uses a setup-first flow:
+
+1. Upload the ICD `.doc` or `.docx` file.
+2. Select both required systems:
+   - Provider system
+   - Consumer system
+3. Click **Process ICD**.
+4. The app runs `GetTables(...)` and navigates into table selection.
+
+Current status:
+
+- The provider/consumer dropdowns call `GetExistingSystems()` to load DB-backed system names.
+- If system loading fails, the UI falls back to placeholder options so setup can still proceed.
+
 ## Resources
 
 - [shadcn/ui](https://ui.shadcn.com/)

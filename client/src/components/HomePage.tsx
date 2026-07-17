@@ -1,9 +1,9 @@
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { useInsight } from "@semoss/sdk/react";
 import { toast } from "sonner";
-import { DocumentUploadTools } from "./DocumentUploadTools";
 import { ModelResultsEditor } from "./ModelResultsEditor";
 import { TableInspectorTools } from "./TableInspectorTools";
+import { Button } from "./ui/button";
 import type {
 	DeletedResultRowEntry,
 	DownloadJsonPayload,
@@ -15,9 +15,75 @@ import type {
 } from "./types";
 
 const MAX_FILE_SIZE_MB = 25;
-const SIDEBAR_MIN_WIDTH = 260;
-const SIDEBAR_MAX_WIDTH = 520;
-const SIDEBAR_DEFAULT_WIDTH = 320;
+const PLACEHOLDER_SYSTEM_OPTIONS = [
+	"Claims Gateway",
+	"Patient Master",
+	"Billing Hub",
+	"Pharmacy Connector",
+	"Eligibility Service",
+];
+
+const formatFileSize = (bytes: number) => {
+	if (bytes < 1024) return `${bytes} B`;
+	const units = ["KB", "MB", "GB"];
+	let value = bytes / 1024;
+	let unitIndex = 0;
+	while (value >= 1024 && unitIndex < units.length - 1) {
+		value /= 1024;
+		unitIndex += 1;
+	}
+	return `${value.toFixed(1)} ${units[unitIndex]}`;
+};
+
+type SearchableSystemSelectProps = {
+	id: string;
+	label: string;
+	value: string;
+	options: string[];
+	searchValue: string;
+	placeholder: string;
+	onSearchChange: (value: string) => void;
+	onChange: (value: string) => void;
+};
+
+const SearchableSystemSelect = ({
+	id,
+	label,
+	value,
+	options,
+	searchValue,
+	placeholder,
+	onSearchChange,
+	onChange,
+}: SearchableSystemSelectProps) => {
+	const filteredOptions = options.filter((option) =>
+		option.toLowerCase().includes(searchValue.trim().toLowerCase()),
+	);
+
+	return (
+		<div>
+			<label htmlFor={id} className="text-sm font-medium">{label}</label>
+			<input
+				type="text"
+				value={searchValue}
+				onChange={(event) => onSearchChange(event.target.value)}
+				placeholder="Search systems..."
+				className="mt-1 h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+			/>
+			<select
+				id={id}
+				value={value}
+				onChange={(event) => onChange(event.target.value)}
+				className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+			>
+				<option value="">{placeholder}</option>
+				{filteredOptions.map((systemName) => (
+					<option key={systemName} value={systemName}>{systemName}</option>
+				))}
+			</select>
+		</div>
+	);
+};
 
 const fileToBase64 = (file: File): Promise<string> =>
 	new Promise((resolve, reject) => {
@@ -291,6 +357,28 @@ const findDsaNames = (node: unknown, depth = 0): string[] => {
 	return [];
 };
 
+const findSystemNames = (node: unknown, depth = 0): string[] => {
+	if (depth > 10 || node == null) return [];
+	if (Array.isArray(node)) {
+		for (const item of node) {
+			const found = findSystemNames(item, depth + 1);
+			if (found.length > 0) return found;
+		}
+		return [];
+	}
+	if (typeof node === "object") {
+		const asRecord = node as Record<string, unknown>;
+		if (Array.isArray(asRecord.systemNames) && asRecord.systemNames.every((x) => typeof x === "string")) {
+			return asRecord.systemNames as string[];
+		}
+		for (const value of Object.values(asRecord)) {
+			const found = findSystemNames(value, depth + 1);
+			if (found.length > 0) return found;
+		}
+	}
+	return [];
+};
+
 const base64ToBlob = (base64: string, mimeType: string) => {
 	const binary = atob(base64);
 	const bytes = new Uint8Array(binary.length);
@@ -323,8 +411,15 @@ export const ExampleComponent = () => {
 	const { actions } = useInsight() as {
 		actions?: { run: (pixel: string) => Promise<unknown> };
 	};
+	const fileInputRef = useRef<HTMLInputElement | null>(null);
 
 	const [selectedFile, setSelectedFile] = useState<File | null>(null);
+	const [workflowStage, setWorkflowStage] = useState<"setup" | "workbench">("setup");
+	const [providerSystem, setProviderSystem] = useState("");
+	const [consumerSystem, setConsumerSystem] = useState("");
+	const [providerSearch, setProviderSearch] = useState("");
+	const [consumerSearch, setConsumerSearch] = useState("");
+	const [systemOptions, setSystemOptions] = useState<string[]>(PLACEHOLDER_SYSTEM_OPTIONS);
 	const [isLoadingTables, setIsLoadingTables] = useState(false);
 	const [isProcessing, setIsProcessing] = useState(false);
 	const [dictionaryFile, setDictionaryFile] = useState<File | null>(null);
@@ -339,8 +434,6 @@ export const ExampleComponent = () => {
 	const [deletedResultRows, setDeletedResultRows] = useState<DeletedResultRowEntry[]>([]);
 	const [modelBatchOutputs, setModelBatchOutputs] = useState<ModelBatchOutput[]>([]);
 	const [isSaving, setIsSaving] = useState(false);
-	const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
-	const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
 	const [dsaOptions, setDsaOptions] = useState<string[]>([]);
 
 	const modifiedRowIds = useMemo(() => {
@@ -379,6 +472,18 @@ export const ExampleComponent = () => {
 			} catch (error) {
 				console.error("Failed to auto-load data subject areas:", error);
 			}
+
+			try {
+				const systemsResult = await actions.run("GetExistingSystems()");
+				const names = findSystemNames(systemsResult)
+					.map((value) => value.trim())
+					.filter((value) => value.length > 0);
+				if (names.length > 0) {
+					setSystemOptions(Array.from(new Set(names)));
+				}
+			} catch (error) {
+				console.warn("Failed to load systems from GetExistingSystems. Using placeholder options.", error);
+			}
 		};
 		loadDSA();
 	}, [actions]);
@@ -403,6 +508,20 @@ export const ExampleComponent = () => {
 		setModelBatchOutputs([]);
 	};
 
+	const clearIcdSelection = () => {
+		setSelectedFile(null);
+		setTableCandidates([]);
+		setSelectedTableIndexes([]);
+		setHasScannedTables(false);
+		setViewMode("selection");
+		setModelResultRows([]);
+		setOriginalModelRowsById({});
+		setDeletedResultRows([]);
+		setModelBatchOutputs([]);
+		setIsProcessing(false);
+		setIsLoadingTables(false);
+	};
+
 	const handleClear = async () => {
 		if (actions?.run) {
 			try {
@@ -411,21 +530,14 @@ export const ExampleComponent = () => {
 				// Local reset still proceeds
 			}
 		}
-		setSelectedFile(null);
-		setTableCandidates([]);
-		setSelectedTableIndexes([]);
-		setHasScannedTables(false);
-		setDictionaryFile(null);
-		setDictionaryLoaded(false);
-		setIsLoadingDictionary(false);
-		setIsLoadingTables(false);
-		setIsProcessing(false);
-		setViewMode("selection");
-		setModelResultRows([]);
-		setOriginalModelRowsById({});
-		setDeletedResultRows([]);
-		setModelBatchOutputs([]);
+		clearIcdSelection();
+		setProviderSystem("");
+		setConsumerSystem("");
+		setProviderSearch("");
+		setConsumerSearch("");
+		setWorkflowStage("setup");
 		setIsSaving(false);
+		if (fileInputRef.current) fileInputRef.current.value = "";
 	};
 
 	const handleUploadDictionary = async (file: File) => {
@@ -453,7 +565,7 @@ export const ExampleComponent = () => {
 		}
 	};
 
-	const handleGetTables = async () => {
+	const handleGetTables = async (onSuccess?: () => void) => {
 		if (!selectedFile) {
 			toast.error("Select an ICD document before choosing tables.");
 			return;
@@ -476,6 +588,7 @@ export const ExampleComponent = () => {
 			setTableCandidates(payload.tableCandidates);
 			setSelectedTableIndexes([]);
 			setHasScannedTables(true);
+			onSuccess?.();
 		} catch (error) {
 			setHasScannedTables(false);
 			const message = error instanceof Error ? error.message : "Failed to identify document tables.";
@@ -483,6 +596,31 @@ export const ExampleComponent = () => {
 		} finally {
 			setIsLoadingTables(false);
 		}
+	};
+
+	const handleProcessIcd = async () => {
+		if (!selectedFile) {
+			toast.error("Upload an ICD document before processing.");
+			return;
+		}
+		if (!providerSystem || !consumerSystem) {
+			toast.error("Select both provider and consumer systems.");
+			return;
+		}
+		if (providerSystem === consumerSystem) {
+			toast.error("Provider and consumer systems must be different.");
+			return;
+		}
+
+		await handleGetTables(() => {
+			setWorkflowStage("workbench");
+			setViewMode("selection");
+		});
+	};
+
+	const handleBackToSetup = () => {
+		setViewMode("selection");
+		setWorkflowStage("setup");
 	};
 
 	const handleGetDataElements = async () => {
@@ -730,86 +868,126 @@ export const ExampleComponent = () => {
 		);
 	};
 
-	const handleToggleSidebar = () => {
-		setIsSidebarCollapsed((current) => !current);
-	};
-
-	const handleSidebarResizeStart = (event: React.MouseEvent<HTMLDivElement>) => {
-		if (isSidebarCollapsed) return;
-		event.preventDefault();
-		const startX = event.clientX;
-		const startWidth = sidebarWidth;
-
-		const onMouseMove = (moveEvent: MouseEvent) => {
-			const next = startWidth + (moveEvent.clientX - startX);
-			const clamped = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, next));
-			setSidebarWidth(clamped);
-		};
-
-		const onMouseUp = () => {
-			window.removeEventListener("mousemove", onMouseMove);
-			window.removeEventListener("mouseup", onMouseUp);
-		};
-
-		window.addEventListener("mousemove", onMouseMove);
-		window.addEventListener("mouseup", onMouseUp);
-	};
-
 	return (
 		<div className="flex flex-col h-screen">
-			{/* Header */}
 			<div className="border-b bg-background p-4 md:p-6">
-				<h1 className="text-2xl font-semibold tracking-tight md:text-3xl">Upload ICD Test</h1>
+				<h1 className="text-2xl font-semibold tracking-tight md:text-3xl">ICD Interface Processing</h1>
 				<p className="mt-2 text-sm text-muted-foreground">
-					Upload files in the left sidebar, then choose tables and extract data elements on the right.
+					{workflowStage === "setup"
+						? "Upload an ICD and select the connected systems before processing."
+						: "Review detected tables and continue with data element extraction."}
 				</p>
 			</div>
 
-			{/* Sidebar + Content Layout */}
-			<div className="flex flex-1 gap-0 overflow-hidden">
-				<div
-					className="relative h-full flex-shrink-0 border-r bg-muted/20"
-					style={{ width: isSidebarCollapsed ? 56 : sidebarWidth }}
-				>
-					{isSidebarCollapsed ? (
-						<div className="flex h-full items-start justify-center pt-4">
-							<button
-								type="button"
-								onClick={handleToggleSidebar}
-								className="rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-muted"
-								title="Expand sidebar"
-							>
-								Expand
-							</button>
+			{workflowStage === "setup" ? (
+				<div className="flex flex-1 items-start justify-center overflow-y-auto bg-muted/20 p-4 md:p-10">
+					<div className="w-full max-w-3xl rounded-xl border bg-card p-6 shadow-sm md:p-8">
+						<h2 className="text-xl font-semibold">Process ICD</h2>
+						<p className="mt-1 text-sm text-muted-foreground">
+							Upload one ICD document and select the two systems connected by the interface.
+						</p>
+
+						<div className="mt-6 space-y-5">
+							<div>
+								<p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">ICD Document</p>
+								<div className="mt-2 flex flex-col gap-3 rounded-lg border p-4">
+									<input
+										ref={fileInputRef}
+										type="file"
+										accept=".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+										className="hidden"
+										onChange={(event) => {
+											const file = event.target.files?.[0];
+											if (file) handleSelectIcdFile(file);
+										}}
+									/>
+									<div className="flex flex-wrap items-center gap-3">
+										<Button
+											type="button"
+											variant="outline"
+											onClick={() => fileInputRef.current?.click()}
+										>
+											{selectedFile ? "Replace ICD Document" : "Upload ICD Document"}
+										</Button>
+										{selectedFile && (
+											<Button type="button" variant="ghost" onClick={handleClear}>
+												Clear
+											</Button>
+										)}
+									</div>
+									{selectedFile ? (
+										<p className="text-sm text-muted-foreground">
+											Selected: <span className="font-medium text-foreground">{selectedFile.name}</span> ({formatFileSize(selectedFile.size)})
+										</p>
+									) : (
+										<p className="text-sm text-muted-foreground">Accepted file types: .doc, .docx (max {MAX_FILE_SIZE_MB} MB)</p>
+									)}
+								</div>
+							</div>
+
+							<div className="grid gap-4 md:grid-cols-2">
+								<SearchableSystemSelect
+									id="provider-system"
+									label="Provider System"
+									value={providerSystem}
+									options={systemOptions}
+									searchValue={providerSearch}
+									placeholder="Select provider system"
+									onSearchChange={setProviderSearch}
+									onChange={setProviderSystem}
+								/>
+
+								<SearchableSystemSelect
+									id="consumer-system"
+									label="Consumer System"
+									value={consumerSystem}
+									options={systemOptions}
+									searchValue={consumerSearch}
+									placeholder="Select consumer system"
+									onSearchChange={setConsumerSearch}
+									onChange={setConsumerSystem}
+								/>
+							</div>
+
+							<p className="text-xs text-muted-foreground">
+								System options are loaded from GetExistingSystems() when available, with placeholder fallback values.
+							</p>
+
+							<div className="flex justify-end">
+								<Button
+									type="button"
+									onClick={handleProcessIcd}
+									disabled={isLoadingTables || !selectedFile || !providerSystem || !consumerSystem || providerSystem === consumerSystem}
+								>
+									{isLoadingTables ? "Processing ICD..." : "Process ICD"}
+								</Button>
+							</div>
 						</div>
-					) : (
-						<>
-							<button
-								type="button"
-								onClick={handleToggleSidebar}
-								className="absolute right-3 top-3 z-20 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-muted"
-								title="Collapse sidebar"
-							>
-								Collapse
-							</button>
-							<DocumentUploadTools
-								dictionaryLoaded={dictionaryLoaded}
-								selectedFile={selectedFile}
-								isLoadingTables={isLoadingTables}
-								maxFileSizeBytes={maxFileSizeBytes}
-								onSelectIcdFile={handleSelectIcdFile}
-								onClear={handleClear}
-								onChooseTables={handleGetTables}
-							/>
-							<div
-								className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize bg-transparent hover:bg-primary/20"
-								onMouseDown={handleSidebarResizeStart}
-								title="Resize sidebar"
-							/>
-						</>
-					)}
+					</div>
 				</div>
-				{viewMode === "selection" ? (
+			) : (
+				<div className="flex flex-1 flex-col overflow-hidden">
+					<div className="border-b bg-muted/20 px-4 py-3 md:px-6">
+						<div className="flex flex-wrap items-center justify-between gap-3">
+							<div className="text-sm text-muted-foreground">
+								<span className="font-medium text-foreground">{selectedFile?.name}</span>
+								<span className="mx-2">|</span>
+								Provider: <span className="font-medium text-foreground">{providerSystem || "-"}</span>
+								<span className="mx-2">|</span>
+								Consumer: <span className="font-medium text-foreground">{consumerSystem || "-"}</span>
+							</div>
+							<div className="flex items-center gap-2">
+								<Button type="button" variant="outline" onClick={handleBackToSetup}>
+									Back to ICD Setup
+								</Button>
+								<Button type="button" variant="ghost" onClick={handleClear}>
+									Clear ICD Data
+								</Button>
+							</div>
+						</div>
+					</div>
+
+					{viewMode === "selection" ? (
 					<TableInspectorTools
 						selectedFile={selectedFile}
 						hasScannedTables={hasScannedTables}
@@ -818,7 +996,7 @@ export const ExampleComponent = () => {
 						selectedTableIndexes={selectedTableIndexes}
 						isProcessing={isProcessing}
 						onToggleTable={handleToggleTable}
-						onRescan={handleGetTables}
+						onRescan={() => handleGetTables()}
 						onGetDataElements={handleGetDataElements}
 					/>
 				) : (
@@ -838,8 +1016,9 @@ export const ExampleComponent = () => {
 						onBackToSelection={handleBackToSelection}
 						onDownloadJson={handleDownloadResultsJson}
 					/>
-				)}
-			</div>
+					)}
+				</div>
+			)}
 		</div>
 	);
 };

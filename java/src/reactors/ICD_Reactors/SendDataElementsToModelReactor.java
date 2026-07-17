@@ -25,6 +25,30 @@ import reactors.AbstractProjectReactor;
  */
 public class SendDataElementsToModelReactor extends AbstractProjectReactor {
 
+  private static final class TableFragment {
+    private final String sourceLabel;
+    private final List<String> headerRow;
+    private final List<List<String>> rows;
+    private final int startRow;
+    private final int endRow;
+    private final int totalSourceRows;
+
+    private TableFragment(
+        String sourceLabel,
+        List<String> headerRow,
+        List<List<String>> rows,
+        int startRow,
+        int endRow,
+        int totalSourceRows) {
+      this.sourceLabel = sourceLabel;
+      this.headerRow = headerRow;
+      this.rows = rows;
+      this.startRow = startRow;
+      this.endRow = endRow;
+      this.totalSourceRows = totalSourceRows;
+    }
+  }
+
   private static final String TABLE_INDEXES_KEY = "tableIndexes";
   private static final String ENGINE_KEY = "engine";
 
@@ -96,18 +120,18 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
     }
 
     int totalRows = countRows(selectedTables);
-    List<List<Map<String, Object>>> batches = toBatches(selectedTables, DEFAULT_BATCH_SIZE);
+    List<List<TableFragment>> batches = toBatches(selectedTables, DEFAULT_BATCH_SIZE);
     List<Map<String, Object>> batchResults = new ArrayList<>();
 
     for (int i = 0; i < batches.size(); i++) {
       int batchNumber = i + 1;
-      List<Map<String, Object>> batch = batches.get(i);
+      List<TableFragment> batch = batches.get(i);
       String prompt = buildBatchPrompt(documentName, batchNumber, batches.size(), batch);
       String pixel = buildLlmPixel(engine, prompt, dictionaryText);
 
       Map<String, Object> batchResult = new LinkedHashMap<>();
       batchResult.put("batchNumber", batchNumber);
-      batchResult.put("batchSize", batch.size());
+      batchResult.put("batchSize", countBatchRows(batch));
       batchResult.put("prompt", prompt);
       batchResult.put("llmCommand", pixel);
       batchResults.add(batchResult);
@@ -208,27 +232,61 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
     return count;
   }
 
-  private List<List<Map<String, Object>>> toBatches(List<Map<String, Object>> tables, int batchSize) {
-    List<List<Map<String, Object>>> batches = new ArrayList<>();
-    List<Map<String, Object>> currentBatch = new ArrayList<>();
+  @SuppressWarnings("unchecked")
+  private List<List<TableFragment>> toBatches(List<Map<String, Object>> tables, int batchSize) {
+    List<List<TableFragment>> batches = new ArrayList<>();
+    List<TableFragment> currentBatch = new ArrayList<>();
     int currentRowCount = 0;
 
     for (Map<String, Object> table : tables) {
+      String sourceLabel = String.valueOf(table.getOrDefault("sourceTableLabel", "Unknown"));
+      Object headerObj = table.get("headerRow");
       Object rowsObj = table.get("rows");
-      int tableRowCount = rowsObj instanceof List ? ((List<?>) rowsObj).size() : 0;
-
-      // If current batch is full and has items, start a new batch
-      if (currentRowCount + tableRowCount > batchSize && !currentBatch.isEmpty()) {
-        batches.add(new ArrayList<>(currentBatch));
-        currentBatch.clear();
-        currentRowCount = 0;
+      if (!(rowsObj instanceof List)) {
+        continue;
       }
 
-      currentBatch.add(table);
-      currentRowCount += tableRowCount;
+      List<List<String>> rows = (List<List<String>>) rowsObj;
+      if (rows.isEmpty()) {
+        continue;
+      }
+
+      List<String> headerRow = headerObj instanceof List ? (List<String>) headerObj : new ArrayList<>();
+      int totalRowsInSource = rows.size();
+      int rowCursor = 0;
+
+      while (rowCursor < totalRowsInSource) {
+        if (currentRowCount == batchSize) {
+          batches.add(new ArrayList<>(currentBatch));
+          currentBatch.clear();
+          currentRowCount = 0;
+        }
+
+        int remainingCapacity = batchSize - currentRowCount;
+        int rowsRemainingInTable = totalRowsInSource - rowCursor;
+        int rowsToTake = Math.min(remainingCapacity, rowsRemainingInTable);
+
+        List<List<String>> fragmentRows = new ArrayList<>();
+        for (int i = rowCursor; i < rowCursor + rowsToTake; i++) {
+          fragmentRows.add(rows.get(i));
+        }
+
+        TableFragment fragment =
+          new TableFragment(
+            sourceLabel,
+            new ArrayList<>(headerRow),
+            fragmentRows,
+            rowCursor + 1,
+            rowCursor + rowsToTake,
+            totalRowsInSource);
+
+        currentBatch.add(fragment);
+        currentRowCount += rowsToTake;
+        rowCursor += rowsToTake;
+      }
     }
 
-    // Add any remaining tables
+    // Add any remaining fragments
     if (!currentBatch.isEmpty()) {
       batches.add(currentBatch);
     }
@@ -236,12 +294,20 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
     return batches;
   }
 
+  private int countBatchRows(List<TableFragment> batch) {
+    int count = 0;
+    for (TableFragment fragment : batch) {
+      count += fragment.rows.size();
+    }
+    return count;
+  }
+
   @SuppressWarnings("unchecked")
   private String buildBatchPrompt(
       String documentName,
       int batchNumber,
       int totalBatches,
-      List<Map<String, Object>> batchTables) {
+      List<TableFragment> batchTables) {
     StringBuilder sb = new StringBuilder();
     sb.append("You are assisting with ICD data element extraction. ")
       .append("Use the data dictionary context to identify data elements, derive a concise Description from ICD row context, infer Variable Type, Field Length, Delimited status, and Value Range from ICD table content, and assign Data Subject Areas to each. ")
@@ -262,41 +328,46 @@ public class SendDataElementsToModelReactor extends AbstractProjectReactor {
     sb.append("IMPORTANT: In each table below, the first row after the header separator line (---) is DATA, not a header. ")
       .append("Do NOT extract column names as data elements. Only extract from the actual data rows.\n\n");
 
-    for (Map<String, Object> table : batchTables) {
-      String sourceLabel = String.valueOf(table.getOrDefault("sourceTableLabel", "Unknown"));
-      Object headerObj = table.get("headerRow");
-      Object rowsObj = table.get("rows");
-
-      if (rowsObj instanceof List) {
-        List<List<String>> rows = (List<List<String>>) rowsObj;
-        sb.append("Table: ").append(sourceLabel).append(" (").append(rows.size()).append(" data rows)\n");
+    for (TableFragment fragment : batchTables) {
+      if (fragment.totalSourceRows > fragment.rows.size()) {
+        sb.append("Table: ")
+          .append(fragment.sourceLabel)
+          .append(" (rows ")
+          .append(fragment.startRow)
+          .append("-")
+          .append(fragment.endRow)
+          .append(" of ")
+          .append(fragment.totalSourceRows)
+          .append(", ")
+          .append(fragment.rows.size())
+          .append(" data rows in this batch)\n");
       } else {
-        sb.append("Table: ").append(sourceLabel).append("\n");
+        sb.append("Table: ")
+          .append(fragment.sourceLabel)
+          .append(" (")
+          .append(fragment.rows.size())
+          .append(" data rows)\n");
       }
 
-      if (headerObj instanceof List) {
-        List<String> headers = (List<String>) headerObj;
+      if (!fragment.headerRow.isEmpty()) {
         sb.append("| ");
-        for (String header : headers) {
+        for (String header : fragment.headerRow) {
           sb.append(header).append(" | ");
         }
         sb.append("\n");
         sb.append("|");
-        for (int i = 0; i < headers.size(); i++) {
+        for (int i = 0; i < fragment.headerRow.size(); i++) {
           sb.append(" --- |");
         }
         sb.append("\n");
       }
 
-      if (rowsObj instanceof List) {
-        List<List<String>> rows = (List<List<String>>) rowsObj;
-        for (List<String> row : rows) {
-          sb.append("| ");
-          for (String cell : row) {
-            sb.append(cell == null ? "" : cell).append(" | ");
-          }
-          sb.append("\n");
+      for (List<String> row : fragment.rows) {
+        sb.append("| ");
+        for (String cell : row) {
+          sb.append(cell == null ? "" : cell).append(" | ");
         }
+        sb.append("\n");
       }
 
       sb.append("\n");
